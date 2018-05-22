@@ -18,6 +18,7 @@ package tasks
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -44,8 +45,8 @@ import (
 	"github.com/containerd/containerd/services"
 	"github.com/containerd/typeurl"
 	ptypes "github.com/gogo/protobuf/types"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -79,14 +80,14 @@ func initFunc(ic *plugin.InitContext) (interface{}, error) {
 		return nil, err
 	}
 	cs := m.(*metadata.DB).ContentStore()
-	runtimes := make(map[string]runtime.Runtime)
+	runtimes := make(map[string]runtime.PlatformRuntime)
 	for _, rr := range rt {
 		ri, err := rr.Instance()
 		if err != nil {
 			log.G(ic.Context).WithError(err).Warn("could not load runtime instance due to initialization error")
 			continue
 		}
-		r := ri.(runtime.Runtime)
+		r := ri.(runtime.PlatformRuntime)
 		runtimes[r.ID()] = r
 	}
 
@@ -102,7 +103,7 @@ func initFunc(ic *plugin.InitContext) (interface{}, error) {
 }
 
 type local struct {
-	runtimes  map[string]runtime.Runtime
+	runtimes  map[string]runtime.PlatformRuntime
 	db        *metadata.DB
 	store     content.Store
 	publisher events.Publisher
@@ -114,14 +115,18 @@ func (l *local) Create(ctx context.Context, r *api.CreateTaskRequest, _ ...grpc.
 		err            error
 	)
 	if r.Checkpoint != nil {
-		checkpointPath, err = ioutil.TempDir("", "ctrd-checkpoint")
+		checkpointPath, err = ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "ctrd-checkpoint")
 		if err != nil {
 			return nil, err
 		}
 		if r.Checkpoint.MediaType != images.MediaTypeContainerd1Checkpoint {
 			return nil, fmt.Errorf("unsupported checkpoint type %q", r.Checkpoint.MediaType)
 		}
-		reader, err := l.store.ReaderAt(ctx, r.Checkpoint.Digest)
+		reader, err := l.store.ReaderAt(ctx, ocispec.Descriptor{
+			MediaType: r.Checkpoint.MediaType,
+			Digest:    r.Checkpoint.Digest,
+			Size:      r.Checkpoint.Size_,
+		})
 		if err != nil {
 			return nil, err
 		}
@@ -450,7 +455,7 @@ func (l *local) Checkpoint(ctx context.Context, r *api.CheckpointTaskRequest, _ 
 	if err != nil {
 		return nil, err
 	}
-	image, err := ioutil.TempDir("", "ctd-checkpoint")
+	image, err := ioutil.TempDir(os.Getenv("XDG_RUNTIME_DIR"), "ctd-checkpoint")
 	if err != nil {
 		return nil, errdefs.ToGRPC(err)
 	}
@@ -573,7 +578,7 @@ func getTasksMetrics(ctx context.Context, filter filters.Filter, tasks []runtime
 }
 
 func (l *local) writeContent(ctx context.Context, mediaType, ref string, r io.Reader) (*types.Descriptor, error) {
-	writer, err := l.store.Writer(ctx, ref, 0, "")
+	writer, err := l.store.Writer(ctx, content.WithRef(ref), content.WithDescriptor(ocispec.Descriptor{MediaType: mediaType}))
 	if err != nil {
 		return nil, err
 	}
@@ -625,7 +630,7 @@ func (l *local) getTaskFromContainer(ctx context.Context, container *containers.
 	return t, nil
 }
 
-func (l *local) getRuntime(name string) (runtime.Runtime, error) {
+func (l *local) getRuntime(name string) (runtime.PlatformRuntime, error) {
 	runtime, ok := l.runtimes[name]
 	if !ok {
 		return nil, status.Errorf(codes.NotFound, "unknown runtime %q", name)
